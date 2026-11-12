@@ -289,6 +289,12 @@ enum CallErrorPriority {
     BindingError = 2,
 }
 
+/// The result and priority of a given callable.
+struct CallStatus {
+    result: Result<(), CallErrorKind>,
+    error_priority: CallErrorPriority,
+}
+
 fn generic_context_has_paramspec<'db>(
     db: &'db dyn Db,
     generic_context: GenericContext<'db>,
@@ -343,24 +349,39 @@ impl<'db> CallableItem<'db> {
         call_expression_tcx: TypeContext<'db>,
         mode: CheckTypesMode,
     ) {
-        match self {
-            CallableItem::Regular(binding) => {
-                binding.check_types(
-                    db,
-                    env,
-                    constraints,
-                    argument_types,
-                    call_expression_tcx,
-                    mode,
-                );
+        let binding = self.callable_mut();
+        binding.check_types(
+            db,
+            env,
+            constraints,
+            argument_types,
+            call_expression_tcx,
+            mode,
+        );
+
+        if mode.is_provisional() {
+            // A failed overload remains a candidate for the next round of fixpoint iteration,
+            // but its failed specialization should not supply argument type context.
+            if binding.overloads.len() > 1 && binding.matching_overloads().next().is_some() {
+                for overload in &mut binding.overloads {
+                    if overload.has_errors_affecting_overload_resolution() {
+                        overload.inference = None;
+                    }
+                }
             }
-            CallableItem::Constructor(binding) => {
-                binding.check_types(
+
+            // A later iteration can change the return type of __new__ and make __init__ applicable.
+            if let Some(downstream) = self
+                .as_constructor_mut()
+                .and_then(ConstructorBinding::downstream_constructor_mut)
+            {
+                let _ = downstream.check_types_impl(
                     db,
                     env,
                     constraints,
                     argument_types,
                     call_expression_tcx,
+                    &[],
                     mode,
                 );
             }
@@ -419,24 +440,60 @@ impl<'db> CallableItem<'db> {
         }
     }
 
-    fn as_result(&self, db: &'db dyn Db) -> Result<(), CallErrorKind> {
-        self.callable().as_result()?;
+    fn call_status(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        include_inactive: bool,
+    ) -> CallStatus {
+        let mut status = CallStatus {
+            result: self.callable().as_result(),
+            error_priority: self.callable().error_priority(),
+        };
 
-        self.as_constructor()
-            .and_then(|binding| binding.downstream_constructor())
-            .map_or(Ok(()), |bindings| bindings.as_result(db))
+        if let Some(downstream) = self.downstream_constructor(db, env, include_inactive) {
+            let downstream = downstream.call_status(db, env, include_inactive);
+            status.result = status.result.and(downstream.result);
+            status.error_priority = status.error_priority.max(downstream.error_priority);
+        }
+
+        status
     }
 
     fn has_own_diagnostics(&self) -> bool {
         self.callable().as_result().is_err()
     }
 
-    fn error_priority(&self, db: &'db dyn Db) -> CallErrorPriority {
-        let priority = self.callable().error_priority();
-        self.as_constructor()
-            .and_then(|binding| binding.downstream_constructor())
-            .map_or(priority, |bindings| {
-                priority.max(bindings.error_priority(db))
+    fn error_priority(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> CallErrorPriority {
+        self.call_status(db, env, true).error_priority
+    }
+
+    fn downstream_constructor(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        include_inactive: bool,
+    ) -> Option<&Bindings<'db>> {
+        let constructor = self.as_constructor()?;
+        if include_inactive || constructor.should_check_downstream(db, env) {
+            constructor.downstream_constructor()
+        } else {
+            None
+        }
+    }
+
+    /// Top callables contribute useful return-type information (e.g. `Awaitable[object]`) for narrowed
+    /// intersections like `f: KnownCallable & Top[Callable[..., Awaitable[object]]]`, even though the
+    /// top-callable call itself is unsafe. (We know that somewhere in the infinite-union of the top
+    /// callable, there is a callable with the right parameters to match the call.)
+    ///
+    /// Likewise, a narrowed class can provide a more specific constructor signature than `type[T]`.
+    /// Even when the `type[T]` constructor rejects the arguments, its return type still constrains
+    /// the successful constructor call.
+    fn constrains_intersection_return_type(&self, priority: CallErrorPriority) -> bool {
+        priority == CallErrorPriority::TopCallable
+            || self.as_constructor().is_some_and(|constructor| {
+                matches!(constructor.constructed_instance_type(), Type::TypeVar(_))
             })
     }
 
@@ -563,56 +620,91 @@ impl<'db> BindingsElement<'db> {
     }
 
     /// Returns the result of calling this element.
-    /// For intersections, if any binding succeeds, the element succeeds.
-    /// When all bindings fail, returns the error from the highest-priority binding.
-    fn as_result(&self, db: &'db dyn Db) -> Result<(), CallErrorKind> {
-        // If any binding succeeds, the element succeeds
-        if self.items.iter().any(|b| b.as_result(db).is_ok()) {
-            return Ok(());
+    fn as_result(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Result<(), CallErrorKind> {
+        self.call_status(db, env, true).result
+    }
+
+    /// Returns the status of this call.
+    ///
+    /// For intersections, if any binding succeeds, the element succeeds. When all bindings
+    /// fail, returns the error from the highest-priority binding.
+    fn call_status(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        include_inactive: bool,
+    ) -> CallStatus {
+        let mut statuses = if include_inactive {
+            Either::Left(
+                self.items
+                    .iter()
+                    .map(|item| item.call_status(db, env, true)),
+            )
+        } else {
+            Either::Right(
+                self.successful_items(db, env)
+                    .into_iter()
+                    .map(|(_, status)| status),
+            )
+        };
+
+        let Some(mut status) = statuses.next() else {
+            return CallStatus {
+                result: Err(CallErrorKind::NotCallable),
+                error_priority: CallErrorPriority::NotCallable,
+            };
+        };
+
+        for item in statuses {
+            if item.result.is_ok()
+                || (status.result.is_err() && item.error_priority > status.error_priority)
+            {
+                status.result = item.result;
+            }
+
+            status.error_priority = status.error_priority.max(item.error_priority);
         }
-
-        // All bindings failed - find highest priority and return that error kind
-        let max_priority = self.error_priority(db);
-
-        // Return the error from the first binding with the highest priority
-        Err(self
-            .items
-            .iter()
-            .find(|b| b.error_priority(db) == max_priority)
-            .map(|b| b.as_result(db).unwrap_err())
-            .unwrap_or(CallErrorKind::NotCallable))
+        status
     }
 
     /// Filter bindings in an intersection once at least one binding succeeded.
-    ///
-    /// We keep successful bindings, and also keep top-callable failures. Top callables contribute
-    /// useful return-type information (e.g. `Awaitable[object]`) for narrowed intersections like
-    /// `f: KnownCallable & Top[Callable[..., Awaitable[object]]]`, even though the top-callable
-    /// call itself is unsafe. (We know that somewhere in the infinite-union of the top callable,
-    /// there is a callable with the right parameters to match the call.)
-    ///
-    /// Likewise, a narrowed class can provide a more specific constructor signature than `type[T]`.
-    /// Even when the `type[T]` constructor rejects the arguments, its return type still constrains
-    /// the successful constructor call.
-    fn retain_successful(&mut self, db: &'db dyn Db) {
-        if self.is_intersection() && self.as_result(db).is_ok() {
+    fn retain_successful(&mut self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) {
+        if self.is_intersection() && self.as_result(db, env).is_ok() {
             self.items.retain(|item| {
-                item.as_result(db).is_ok()
-                    || item.error_priority(db) == CallErrorPriority::TopCallable
-                    || item.as_constructor().is_some_and(|constructor| {
-                        matches!(constructor.constructed_instance_type(), Type::TypeVar(_))
-                    })
+                let status = item.call_status(db, env, true);
+                status.result.is_ok()
+                    || item.constrains_intersection_return_type(status.error_priority)
             });
         }
     }
 
-    /// Returns the error priority for this element (used when all bindings failed).
-    fn error_priority(&self, db: &'db dyn Db) -> CallErrorPriority {
-        self.items
+    /// Returns the successful bindings for this item, including active constructor paths.
+    fn successful_items(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Vec<(&CallableItem<'db>, CallStatus)> {
+        let mut items: Vec<_> = self
+            .items
             .iter()
-            .map(|item| item.error_priority(db))
-            .max()
-            .unwrap_or(CallErrorPriority::NotCallable)
+            .map(|item| {
+                let status = item.call_status(db, env, false);
+                (item, status)
+            })
+            .collect();
+
+        if self.is_intersection() && items.iter().any(|(_, status)| status.result.is_ok()) {
+            items.retain(|(item, status)| {
+                status.result.is_ok()
+                    || item.constrains_intersection_return_type(status.error_priority)
+            });
+        }
+
+        items
     }
 
     /// Returns true if any binding in this element is callable.
@@ -691,19 +783,34 @@ impl CheckTypesMode {
 }
 
 impl<'db> Bindings<'db> {
-    fn as_result(&self, db: &'db dyn Db) -> Result<(), CallErrorKind> {
+    fn as_result(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> Result<(), CallErrorKind> {
+        self.call_status(db, env, true).result
+    }
+
+    fn call_status(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        include_inactive: bool,
+    ) -> CallStatus {
         let mut all_ok = true;
         let mut any_binding_error = false;
         let mut all_not_callable = true;
+        let mut error_priority = CallErrorPriority::NotCallable;
 
         for element in &self.elements {
-            let result = element.as_result(db);
-            all_ok &= result.is_ok();
-            any_binding_error |= matches!(result, Err(CallErrorKind::BindingError));
-            all_not_callable &= matches!(result, Err(CallErrorKind::NotCallable));
+            let status = element.call_status(db, env, include_inactive);
+            all_ok &= status.result.is_ok();
+            any_binding_error |= matches!(status.result, Err(CallErrorKind::BindingError));
+            all_not_callable &= matches!(status.result, Err(CallErrorKind::NotCallable));
+            error_priority = error_priority.max(status.error_priority);
         }
 
-        if all_ok {
+        let result = if all_ok {
             Ok(())
         } else if any_binding_error {
             Err(CallErrorKind::BindingError)
@@ -711,15 +818,12 @@ impl<'db> Bindings<'db> {
             Err(CallErrorKind::NotCallable)
         } else {
             Err(CallErrorKind::PossiblyNotCallable)
-        }
-    }
+        };
 
-    fn error_priority(&self, db: &'db dyn Db) -> CallErrorPriority {
-        self.elements
-            .iter()
-            .map(|element| element.error_priority(db))
-            .max()
-            .unwrap_or(CallErrorPriority::NotCallable)
+        CallStatus {
+            result,
+            error_priority,
+        }
     }
 
     fn set_constructor_instance_type_in_place(
@@ -1129,6 +1233,24 @@ impl<'db> Bindings<'db> {
         }
     }
 
+    /// Visits the callables that contribute argument type context after overload selection,
+    /// including downstream constructors.
+    pub(crate) fn visit_successful_type_context_callables<'a>(
+        &'a self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        visit: &mut impl FnMut(&'a CallableBinding<'db>),
+    ) {
+        for element in &self.elements {
+            for (item, _) in element.successful_items(db, env) {
+                visit(item.callable());
+                if let Some(downstream) = item.downstream_constructor(db, env, false) {
+                    downstream.visit_successful_type_context_callables(db, env, visit);
+                }
+            }
+        }
+    }
+
     /// Visits the given set of overload candidates, invoking the provided callback for each
     /// binding.
     pub(crate) fn visit_overload_set<'a>(
@@ -1438,7 +1560,7 @@ impl<'db> Bindings<'db> {
         // if the matched overload is instance-returning.
         for downstream in self
             .iter_constructor_items_mut()
-            .filter_map(ConstructorBinding::downstream_constructor_mut)
+            .filter_map(|constructor| constructor.retain_downstream_constructor(db, env))
         {
             let _ = downstream.check_types_impl(
                 db,
@@ -1454,28 +1576,30 @@ impl<'db> Bindings<'db> {
         // For intersection elements with at least one successful binding,
         // filter out the failing bindings after deferred constructor checks.
         for element in &mut self.elements {
-            element.retain_successful(db);
+            element.retain_successful(db, env);
         }
 
-        self.as_result(db)
+        self.as_result(db, env)
     }
 
-    /// Finalize the bindings after a provisional check, retaining only those that contribute
-    /// to the final call evaluation.
-    pub(crate) fn finalize_argument_inference(
+    /// Complete overload resolution in preparation for a final round of inference on the set of
+    /// selected overloads.
+    ///
+    /// This method preserves provisional constructors, as they may become active after the final inference.
+    pub(crate) fn finish_overload_resolution(
         &mut self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         call_arguments: &CallArguments<'_, 'db>,
         dataclass_field_specifiers: &[Type<'db>],
-    ) -> Result<(), CallErrorKind> {
-        self.evaluate_known_cases(db, env, call_arguments, dataclass_field_specifiers);
+    ) {
+        self.evaluate_known_callables(db, env, call_arguments, dataclass_field_specifiers);
 
         for constructor in self.iter_constructor_items_mut() {
-            if constructor.discard_downstream_constructor(db, env)
+            if constructor.should_check_downstream(db, env)
                 && let Some(downstream) = constructor.downstream_constructor_mut()
             {
-                let _ = downstream.finalize_argument_inference(
+                downstream.finish_overload_resolution(
                     db,
                     env,
                     call_arguments,
@@ -1483,12 +1607,82 @@ impl<'db> Bindings<'db> {
                 );
             }
         }
+    }
 
-        for element in &mut self.elements {
-            element.retain_successful(db);
+    /// Check the selected set of overloads using the argument types inferred in this round.
+    pub(crate) fn check_selected_overload_types(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        matching_arguments: &CallArguments<'_, 'db>,
+        inferred_arguments: &CallArguments<'_, 'db>,
+        result_tcx: TypeContext<'db>,
+        dataclass_field_specifiers: &[Type<'db>],
+    ) -> Result<(), CallErrorKind> {
+        // We only re-solve the selected overloads if we need to apply a declared type preference,
+        // or if the arguments changed after re-inference.
+        let should_evaluate_overloads = result_tcx.without_preference() != result_tcx
+            || !matching_arguments.same_inferred_types(inferred_arguments);
+
+        self.finalize_with(db, env, &mut |bindings| {
+            if should_evaluate_overloads {
+                for binding in bindings.iter_flat_mut() {
+                    binding.check_selected_overload_types(
+                        db,
+                        env,
+                        matching_arguments,
+                        inferred_arguments,
+                        result_tcx,
+                    );
+                }
+
+                bindings.evaluate_known_callables(
+                    db,
+                    env,
+                    inferred_arguments,
+                    dataclass_field_specifiers,
+                );
+            }
+
+            bindings.evaluate_property_calls(db, env, inferred_arguments);
+        })
+    }
+
+    /// Finalize the bindings after fixpoint iteration has converged, retaining only those that
+    /// contribute to the final call evaluation.
+    pub(crate) fn finalize_argument_inference(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        call_arguments: &CallArguments<'_, 'db>,
+        dataclass_field_specifiers: &[Type<'db>],
+    ) -> Result<(), CallErrorKind> {
+        self.finalize_with(db, env, &mut |bindings| {
+            bindings.evaluate_known_cases(db, env, call_arguments, dataclass_field_specifiers);
+        })
+    }
+
+    /// Evaluate the bindings using the provided callback, discarding any inactive constructors or
+    /// unsuccessful intersections.
+    fn finalize_with(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        evaluate: &mut impl FnMut(&mut Self),
+    ) -> Result<(), CallErrorKind> {
+        evaluate(self);
+
+        for constructor in self.iter_constructor_items_mut() {
+            if let Some(downstream) = constructor.retain_downstream_constructor(db, env) {
+                let _ = downstream.finalize_with(db, env, evaluate);
+            }
         }
 
-        self.as_result(db)
+        for element in &mut self.elements {
+            element.retain_successful(db, env);
+        }
+
+        self.as_result(db, env)
     }
 
     /// Returns true if this is a single callable (not a union or intersection).
@@ -1654,8 +1848,10 @@ impl<'db> Bindings<'db> {
         node: ast::AnyNodeRef,
         element: &BindingsElement<'db>,
     ) {
-        // If this element succeeded, no diagnostics to report
-        if element.as_result(context.db()).is_ok() {
+        let db = context.db();
+        let env = context.program_environment();
+        let status = element.call_status(db, env, true);
+        if status.result.is_ok() {
             return;
         }
 
@@ -1663,13 +1859,10 @@ impl<'db> Bindings<'db> {
 
         // For intersection elements, use priority hierarchy
         if element.is_intersection() {
-            // Find the highest priority error among bindings in this element
-            let max_priority = element.error_priority(context.db());
-
             // Only report errors from bindings with the highest priority
             for item in &element.items {
                 let binding = item.callable();
-                if item.error_priority(context.db()) == max_priority {
+                if item.error_priority(db, env) == status.error_priority {
                     if !item.has_own_diagnostics() {
                         continue;
                     }
@@ -1698,9 +1891,6 @@ impl<'db> Bindings<'db> {
                     return;
                 }
                 let binding = item.callable();
-                if element.as_result(context.db()).is_ok() {
-                    return;
-                }
                 let union_diag = UnionDiagnostic {
                     callable_type: self.callable_type(),
                     variant_type: element.callable_type,
@@ -1710,9 +1900,21 @@ impl<'db> Bindings<'db> {
         }
     }
 
+    /// Evaluates any known callables and property initializers.
+    fn evaluate_known_cases(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        call_arguments: &CallArguments<'_, 'db>,
+        dataclass_field_specifiers: &[Type<'db>],
+    ) {
+        self.evaluate_known_callables(db, env, call_arguments, dataclass_field_specifiers);
+        self.evaluate_property_calls(db, env, call_arguments);
+    }
+
     /// Evaluates the return type of certain known callables, where we have special-case logic to
     /// determine the return type in a way that isn't directly expressible in the type system.
-    fn evaluate_known_cases(
+    fn evaluate_known_callables(
         &mut self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -3453,8 +3655,6 @@ impl<'db> Bindings<'db> {
                 };
             }
         }
-
-        self.evaluate_property_calls(db, env, call_arguments);
     }
 }
 
@@ -4156,7 +4356,7 @@ impl<'db> CallableBinding<'db> {
         // the non-expanded argument types.
         let post_evaluation_snapshot = snapshotter.take(self);
 
-        for expansion in expansions {
+        for (expansion_index, expansion) in expansions.enumerate() {
             let expanded_argument_lists = match expansion {
                 Expansion::LimitReached(index) => {
                     snapshotter.restore(self, post_evaluation_snapshot);
@@ -4263,30 +4463,17 @@ impl<'db> CallableBinding<'db> {
             }
 
             if cases.len() == expanded_argument_lists.len()
-                && let Some((first, rest)) = cases.split_first()
+                && let Some(return_type) = self.merge_expanded_cases(db, env, &cases)
             {
-                // The merged view supports consumers that need one binding per overload. Keep
-                // the individual evaluations as well: the same generic overload can infer a
-                // different specialization for each expanded argument list.
-                let mut merged_evaluation_state = first.snapshot.clone();
-                for case in rest {
-                    merged_evaluation_state.update(&case.snapshot);
-                }
-                snapshotter.restore(self, merged_evaluation_state);
-
                 // Every expanded argument list must succeed. Alternative matches within a case
                 // cannot compensate for a different argument list with no matches.
                 self.overload_call_result = Some(OverloadCallResult::ArgumentTypeExpansion(
                     Box::new(ExpandedOverloadCall {
-                        return_type: UnionType::from_elements(
-                            db,
-                            env,
-                            cases.iter().map(|case| case.return_type),
-                        ),
+                        return_type,
+                        expansion_index,
                         cases: cases.into_boxed_slice(),
                     }),
                 ));
-
                 return;
             }
         }
@@ -4296,6 +4483,134 @@ impl<'db> CallableBinding<'db> {
         // argument types. This is necessary because we restore the state to the pre-evaluation
         // snapshot when processing the expanded argument lists.
         snapshotter.restore(self, post_evaluation_snapshot);
+    }
+
+    fn merge_expanded_cases(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        cases: &[ExpandedCallEvaluation<'db>],
+    ) -> Option<Type<'db>> {
+        let (first, rest) = cases.split_first()?;
+
+        // The merged view supports consumers that need one binding per overload. Keep
+        // the individual evaluations as well: the same generic overload can infer a
+        // different specialization for each expanded argument list.
+        let mut merged = first.snapshot.clone();
+        for case in rest {
+            merged.update(&case.snapshot);
+        }
+
+        merged.swap_with(self);
+        Some(UnionType::from_elements(
+            db,
+            env,
+            cases.iter().map(|case| case.return_type),
+        ))
+    }
+
+    /// Check the selected set of overloads using the current argument types and type context.
+    ///
+    /// The original argument expansion is preserved for any expanded calls.
+    fn check_selected_overload_types(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        matching_arguments: &CallArguments<'_, 'db>,
+        inferred_arguments: &CallArguments<'_, 'db>,
+        call_expression_tcx: TypeContext<'db>,
+    ) {
+        let inferred_arguments = inferred_arguments.with_self(self.bound_type);
+        let Some(OverloadCallResult::ArgumentTypeExpansion(mut expanded)) = self
+            .overload_call_result
+            .take_if(|result| matches!(result, OverloadCallResult::ArgumentTypeExpansion(_)))
+        else {
+            let selected: SmallVec<[_; 2]> =
+                self.selected_overloads().map(|(index, _)| index).collect();
+
+            self.check_selected_signatures(
+                db,
+                env,
+                &selected,
+                &inferred_arguments,
+                call_expression_tcx,
+            );
+            return;
+        };
+
+        let matching_arguments = matching_arguments.with_self(self.bound_type);
+        let expansions = matching_arguments.expansions(db, env);
+        let Some(Expansion::Expanded(arguments)) = expansions
+            .iter_with_base(&inferred_arguments)
+            .nth(expanded.expansion_index)
+        else {
+            self.overload_call_result = Some(OverloadCallResult::ArgumentTypeExpansion(expanded));
+            return;
+        };
+
+        for (case, arguments) in expanded.cases.iter_mut().zip(arguments) {
+            // Each expanded argument list has its own selected overloads and specializations.
+            case.snapshot.swap_with(self);
+            self.check_selected_signatures(
+                db,
+                env,
+                &case.selected_overloads,
+                &arguments,
+                call_expression_tcx,
+            );
+
+            if self.matching_overloads().next().is_none() {
+                // Every expanded list must succeed for the call to be valid.
+                self.overload_call_result = None;
+                return;
+            }
+
+            case.return_type = self.return_type();
+            case.snapshot.swap_with(self);
+        }
+
+        if let Some(return_type) = self.merge_expanded_cases(db, env, &expanded.cases) {
+            expanded.return_type = return_type;
+            self.overload_call_result = Some(OverloadCallResult::ArgumentTypeExpansion(expanded));
+        }
+    }
+
+    /// Validate and specialize the selected set of signatures after overload resolution has completed.
+    fn check_selected_signatures(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        selected_overloads: &[usize],
+        inferred_arguments: &CallArguments<'_, 'db>,
+        call_expression_tcx: TypeContext<'db>,
+    ) {
+        if self.overload_call_result.is_none()
+            && let [selected] = selected_overloads
+        {
+            // If there are multiple signatures with equivalent return types, only the selected
+            // signature contributes to the final call result.
+            for (index, overload) in self.matching_overloads_mut() {
+                if index != *selected {
+                    overload.mark_as_unmatched_overload();
+                }
+            }
+        }
+
+        for &index in selected_overloads {
+            let overload = &mut self.overloads[index];
+            overload.reset(db);
+            overload.match_parameters(db, env, inferred_arguments);
+            overload.check_types(db, env, inferred_arguments, call_expression_tcx);
+        }
+
+        if matches!(
+            self.overload_call_result,
+            Some(OverloadCallResult::Ambiguous(_))
+        ) {
+            self.overload_call_result = Some(OverloadCallResult::Ambiguous(
+                self.merge_ambiguous_return_types(db, env),
+            ));
+        }
     }
 
     /// Defer type checking for overloads ruled out by a literal argument. If another candidate
@@ -4696,10 +5011,12 @@ impl<'db> CallableBinding<'db> {
             .filter(|(_, overload)| !overload.has_errors_affecting_overload_resolution())
     }
 
-    /// Returns the overloads selected for deprecation reporting without changing the matches
-    /// retained for argument inference. Equivalent return types select the first match;
-    /// ambiguous calls retain every match, and argument expansion combines its selected matches.
-    fn selected_overloads(&self) -> impl Iterator<Item = (usize, &Binding<'db>)> + Clone {
+    /// Returns the overloads selected for the call without changing the matches retained for argument
+    /// inference. Equivalent return types select the first match; ambiguous calls retain every match,
+    /// and argument expansion combines its selected matches.
+    pub(crate) fn selected_overloads(
+        &self,
+    ) -> impl Iterator<Item = (usize, &Binding<'db>)> + Clone {
         let matching = self.matching_overloads();
         let Some(result) = &self.overload_call_result else {
             return Either::Left(matching.take(1));
@@ -4752,11 +5069,22 @@ impl<'db> CallableBinding<'db> {
         }))
     }
 
-    /// Returns the overload which call arguments should be inferred against, if every overload is
-    /// non-matching.
-    pub(crate) fn best_failing_overload(&self) -> Option<&Binding<'db>> {
-        self.best_failing_overload_index(FailingOverloadSelection::AffectsOverloadResolution)
-            .and_then(|index| self.overloads.get(index))
+    /// Returns the overloads which call arguments should be inferred against.
+    ///
+    /// If no overload matches, this method falls back to the best failing overload for diagnostics.
+    pub(crate) fn argument_context_overloads(&self) -> impl Iterator<Item = &Binding<'db>> {
+        let mut selected = self
+            .selected_overloads()
+            .map(|(_, overload)| overload)
+            .peekable();
+        if selected.peek().is_some() {
+            return Either::Left(selected);
+        }
+
+        let failing = self
+            .best_failing_overload_index(FailingOverloadSelection::AffectsOverloadResolution)
+            .and_then(|index| self.overloads.get(index));
+        Either::Right(failing.into_iter())
     }
 
     /// Returns a failing overload only when the call's argument shape selected it uniquely.
@@ -5058,6 +5386,8 @@ enum OverloadCallResult<'db> {
 #[derive(Debug, Clone, get_size2::GetSize, salsa::SalsaValue)]
 struct ExpandedOverloadCall<'db> {
     return_type: Type<'db>,
+    /// Which argument expansion produced these cases, in source order.
+    expansion_index: usize,
     cases: Box<[ExpandedCallEvaluation<'db>]>,
 }
 
@@ -8057,11 +8387,12 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         paramspec: BoundTypeVarInstance<'db>,
     ) -> bool {
         let db = self.db;
+        let env = self.env;
         let Some(callable) = self
             .merged_specialization()
             .and_then(|specialization| specialization.get(db, paramspec))
             .and_then(|value| value.as_paramspec_value(db))
-            .and_then(|value| value.to_callable_type(db, self.env))
+            .and_then(|value| value.to_callable_type(db, env))
         else {
             return false;
         };
@@ -8085,8 +8416,8 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         let error_argument_indices = error_argument_indices.as_deref();
 
         let bindings = match callable
-            .bindings(db, self.env)
-            .match_parameters(db, self.env, &sub_arguments)
+            .bindings(db, env)
+            .match_parameters(db, env, &sub_arguments)
             .check_types(
                 db,
                 self.env,
@@ -8144,12 +8475,12 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         };
 
         for element in &bindings.elements {
-            if element.as_result(db).is_ok() {
+            let status = element.call_status(db, env, true);
+            if status.result.is_ok() {
                 continue;
             }
-            let priority = element.error_priority(db);
             for item in &element.items {
-                if item.error_priority(db) != priority {
+                if item.error_priority(db, env) != status.error_priority {
                     continue;
                 }
                 let callable_binding = item.callable();
@@ -8376,8 +8707,18 @@ fn nested_union_members<'db>(
 /// Specializations shared by all arguments of one overload during an inference pass.
 #[derive(Default)]
 pub(crate) struct ArgumentContextCache<'db> {
+    previous_inference: Option<TypeVarInference<'db>>,
     ordinary: OnceCell<Cow<'db, ArgumentContextSpecialization<'db>>>,
     nested: OnceCell<Option<Specialization<'db>>>,
+}
+
+impl<'db> ArgumentContextCache<'db> {
+    pub(crate) fn from_binding(binding: &Binding<'db>) -> Self {
+        Self {
+            previous_inference: binding.inference,
+            ..Self::default()
+        }
+    }
 }
 
 /// The call specialization inferred during fixpoint generic call inference.
@@ -8852,6 +9193,7 @@ impl<'db> Binding<'db> {
                         generic,
                         constraints,
                         call_expression_tcx,
+                        specialized_overload.inference,
                     );
                     parameter_type =
                         parameter_type.apply_specialization(db, context.specialization);
@@ -9008,6 +9350,7 @@ impl<'db> Binding<'db> {
                         generic_context,
                         constraints,
                         call_expression_tcx,
+                        cache.previous_inference,
                     )
                 })
             };
@@ -9021,9 +9364,9 @@ impl<'db> Binding<'db> {
                 // Specializing `P.args` or `P.kwargs` directly yields the entire parameter list,
                 // which is not a valid type context for an individual argument.
                 let paramspec = typevar.without_paramspec_attr(db);
-                let paramspec_value = self
-                    .merged_specialization(db)
-                    .and_then(|merged| merged.get(db, paramspec))
+                let paramspec_value = cache
+                    .previous_inference
+                    .and_then(|inference| inference.merged_specialization(db).get(db, paramspec))
                     .or_else(|| ordinary_context().specialization.get(db, paramspec))?
                     .as_paramspec_value(db)?;
                 let specialized_parameter_type =
@@ -9051,7 +9394,7 @@ impl<'db> Binding<'db> {
             }
 
             let nested_context = || {
-                self.inference?;
+                cache.previous_inference?;
                 let (union, nested) =
                     nested_union_members(db, env, parameter_type, self.inferable_typevars)?;
                 let actual = arguments_types
@@ -9225,6 +9568,7 @@ impl<'db> Binding<'db> {
         generic_context: GenericContext<'db>,
         constraints: &ConstraintSetBuilder<'db>,
         call_expression_tcx: TypeContext<'db>,
+        previous_inference: Option<TypeVarInference<'db>>,
     ) -> Cow<'db, ArgumentContextSpecialization<'db>> {
         /// With no evidence from the expected return type, every call in this program
         /// with the same generic context and inferred arguments has the same parameter context.
@@ -9301,7 +9645,7 @@ impl<'db> Binding<'db> {
         if return_type_solutions.is_empty()
             && let Some(specialization) = inferred_parameter_context(
                 db,
-                ParameterContextKey::new(db, env, generic_context, self.inference),
+                ParameterContextKey::new(db, env, generic_context, previous_inference),
             )
         {
             return Cow::Borrowed(specialization);
@@ -9310,7 +9654,7 @@ impl<'db> Binding<'db> {
             db,
             env,
             generic_context,
-            self.inference,
+            previous_inference,
             &return_type_solutions,
             call_expression_tcx.kind(),
         ))
@@ -9797,7 +10141,7 @@ impl<'db> Binding<'db> {
         }
     }
 
-    fn restore(&mut self, snapshot: BindingSnapshot<'db>) {
+    fn swap_snapshot(&mut self, snapshot: &mut BindingSnapshot<'db>) {
         let BindingSnapshot {
             return_ty,
             inferable_typevars,
@@ -9806,13 +10150,12 @@ impl<'db> Binding<'db> {
             parameter_tys,
             errors,
         } = snapshot;
-
-        self.return_ty = return_ty;
-        self.inferable_typevars = inferable_typevars;
-        self.inference = inference;
-        self.argument_matches = argument_matches;
-        self.parameter_tys = parameter_tys;
-        self.errors = errors;
+        std::mem::swap(&mut self.return_ty, return_ty);
+        std::mem::swap(&mut self.inferable_typevars, inferable_typevars);
+        std::mem::swap(&mut self.inference, inference);
+        std::mem::swap(&mut self.argument_matches, argument_matches);
+        std::mem::swap(&mut self.parameter_tys, parameter_tys);
+        std::mem::swap(&mut self.errors, errors);
     }
 
     /// Returns a vector where each index corresponds to an argument position,
@@ -9883,7 +10226,15 @@ struct CallableBindingSnapshot<'db> {
     matching_overloads: Vec<(usize, BindingSnapshot<'db>)>,
 }
 
-impl CallableBindingSnapshot<'_> {
+impl<'db> CallableBindingSnapshot<'db> {
+    /// Replace the state of the matched overload bindings with the given snapshot.
+    fn swap_with(&mut self, binding: &mut CallableBinding<'db>) {
+        std::mem::swap(&mut self.overload_result, &mut binding.overload_call_result);
+        for (index, snapshot) in &mut self.matching_overloads {
+            binding.overloads[*index].swap_snapshot(snapshot);
+        }
+    }
+
     /// Merge another expanded argument list's bindings into this snapshot. Both snapshots must
     /// originate from the same snapshotter, so their overload indexes have the same order.
     fn update(&mut self, other: &Self) {
@@ -9954,13 +10305,10 @@ impl CallableBindingSnapshotter {
     fn restore<'db>(
         &self,
         binding: &mut CallableBinding<'db>,
-        snapshot: CallableBindingSnapshot<'db>,
+        mut snapshot: CallableBindingSnapshot<'db>,
     ) {
         debug_assert_eq!(self.0.len(), snapshot.matching_overloads.len());
-        binding.overload_call_result = snapshot.overload_result;
-        for (index, snapshot) in snapshot.matching_overloads {
-            binding.overloads[index].restore(snapshot);
-        }
+        snapshot.swap_with(binding);
     }
 }
 
